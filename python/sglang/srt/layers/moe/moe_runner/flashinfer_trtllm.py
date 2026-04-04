@@ -246,13 +246,17 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         (w2_input_scale_quant * g1_alphas).to(torch.float32),
     )
 
-    # Clean up weights that won't be used by TRT-LLM
-    del (
-        layer.w2_weight,
-        layer.w2_weight_scale,
-        layer.w13_weight,
-        layer.w13_weight_scale,
-    )
+    # In RL mode (enable_memory_saver), keep original weights/scales so that
+    # in-place weight updates can re-write and re-process them.
+    # In pure inference mode, delete to save GPU memory.
+    from sglang.srt.server_args import get_global_server_args
+    if not get_global_server_args().enable_memory_saver:
+        del (
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            layer.w13_weight,
+            layer.w13_weight_scale,
+        )
 
 
 @dataclass

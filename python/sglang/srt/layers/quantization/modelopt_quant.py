@@ -32,7 +32,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    get_fp4_gemm_runner_backend,
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_input_scale_enabled,
+)
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -1401,6 +1405,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
 
+        if nvfp4_online_input_scale_enabled():
+            copy_or_rebind_param(
+                layer, "gemm_weight_scale", weight_scale_2.to(torch.float32)
+            )
+
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
 
@@ -1509,6 +1518,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         output_size = layer.output_size_per_partition
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
+
+        if nvfp4_online_input_scale_enabled():
+            input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+            layer.alpha.copy_(
+                (layer.gemm_weight_scale * input_scale).expand_as(layer.alpha)
+            )
+            layer.input_scale_inv.copy_(
+                input_scale_inv.expand_as(layer.input_scale_inv)
+            )
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
@@ -1820,6 +1838,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.w13_input_scale_quant
                     if MOE_NVFP4_DISPATCH
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    or nvfp4_online_input_scale_enabled()
                     else None
                 )
             }
@@ -1997,6 +2016,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             return self.runner.run(dispatch_output, quant_info)
 
+        w1_weight_scale, w2_weight_scale = None, None
+        if nvfp4_online_input_scale_enabled():
+            w1_weight_scale = layer.w13_weight_scale_2
+            if layer.moe_runner_config.is_gated and w1_weight_scale.dim() > 1:
+                w1_weight_scale = w1_weight_scale[:, 0]
+            w2_weight_scale = layer.w2_weight_scale_2
+
         # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
         # backend is flashinfer_trtllm
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
@@ -2092,6 +2118,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+
+        if nvfp4_online_input_scale_enabled():
+            assert w1_weight_scale is not None
+            if x_sf is None:
+                input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+                layer.w13_input_scale_quant.copy_(
+                    input_scale_inv.expand_as(layer.w13_input_scale_quant)
+                )
+            else:
+                input_scale_inv = layer.w13_input_scale_quant
+                input_scale = 1.0 / input_scale_inv
+            layer.g1_alphas.copy_(
+                (w1_weight_scale * input_scale).expand_as(layer.g1_alphas)
+            )
+
         output = cutlass_moe_fp4(
             a=x,
             a1_gscale=layer.w13_input_scale_quant,
@@ -2106,6 +2147,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             topk_ids=topk_ids,
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+            w1_weight_scale=w1_weight_scale,
+            w2_weight_scale=w2_weight_scale,
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
