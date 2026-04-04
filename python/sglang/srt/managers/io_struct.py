@@ -1274,6 +1274,20 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
 
 
 @dataclass
+class PostProcessWeightsReqInput(BaseReq):
+    """Re-run process_weights_after_loading on quantized layers after in-place weight update."""
+    restore_weights_before_load: bool = False
+    post_process_quantization: bool = False
+    post_load_weights: bool = False
+
+
+@dataclass
+class PostProcessWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str

@@ -167,6 +167,15 @@ class BaseTpWorker(ABC):
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
         return success, message
 
+    def post_process_weights(self, recv_req):
+        """Re-run process_weights_after_loading on quantized layers."""
+        success, message = self.model_runner.post_process_weights(
+            restore_weights_before_load=recv_req.restore_weights_before_load,
+            post_process_quantization=recv_req.post_process_quantization,
+            post_load_weights=recv_req.post_load_weights,
+        )
+        return success, message
+
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.model_runner.get_weights_by_name(
             recv_req.name, recv_req.truncate_size

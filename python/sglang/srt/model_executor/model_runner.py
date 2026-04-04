@@ -1359,6 +1359,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
 
+    def post_process_weights(
+        self,
+        restore_weights_before_load: bool = False,
+        post_process_quantization: bool = False,
+        post_load_weights: bool = False,
+    ):
+        """Re-run process_weights_after_loading on weight quantization layers.
+
+        This is needed after in-place weight updates for quantized models
+        (e.g., NVFP4) where the raw weights are updated but derived
+        quantities (padding, shuffling, alpha, etc.) need to be recomputed.
+
+        Only processes weight quantization layers (Linear, MoE), NOT KV cache
+        quantization layers which have different lifecycle.
+        """
+        if post_process_quantization:
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                ModelOptFp4LinearMethod,
+                ModelOptNvFp4FusedMoEMethod,
+            )
+            target_types = (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)
+            for _, module in self.model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if isinstance(quant_method, target_types):
+                    quant_method.process_weights_after_loading(module)
+        return True, "Success"
+
     def _update_weights_from_flattened_bucket(
         self,
         flattened_tensor_bucket_dict,

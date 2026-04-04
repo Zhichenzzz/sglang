@@ -100,6 +100,17 @@ class SchedulerUpdateWeightsMixin:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
+    def post_process_weights(
+        self: Scheduler, recv_req,
+    ):
+        """Re-run process_weights_after_loading on quantized layers after in-place weight update."""
+        from sglang.srt.managers.io_struct import PostProcessWeightsReqOutput
+        success, message = self.tp_worker.post_process_weights(recv_req)
+        if not success:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return PostProcessWeightsReqOutput(success, message)
+
     def update_weights_from_ipc(
         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
     ):

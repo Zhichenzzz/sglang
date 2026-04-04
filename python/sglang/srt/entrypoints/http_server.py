@@ -921,6 +921,21 @@ async def update_weights_from_tensor(
     )
 
 
+@app.post("/post_process_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def post_process_weights(request: Request):
+    """Re-run process_weights_after_loading on quantized layers after in-place weight update."""
+    from sglang.srt.managers.io_struct import PostProcessWeightsReqInput
+    obj = PostProcessWeightsReqInput(**(await request.json()))
+    success, message = await _global_state.tokenizer_manager.post_process_weights(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
