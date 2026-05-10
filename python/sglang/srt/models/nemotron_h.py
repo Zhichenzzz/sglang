@@ -17,6 +17,8 @@
 
 from collections.abc import Iterable
 from typing import Optional, Union
+import json
+import os
 
 import torch
 from torch import nn
@@ -31,6 +33,7 @@ from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -40,6 +43,17 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -85,6 +99,260 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
+
+_NEMO_DEBUG_FORWARD_CALL = 0
+
+
+def _next_debug_forward_call() -> Optional[int]:
+    global _NEMO_DEBUG_FORWARD_CALL
+    if not os.environ.get("NEMO_DP_DEBUG_DUMP"):
+        return None
+    call_id = _NEMO_DEBUG_FORWARD_CALL
+    _NEMO_DEBUG_FORWARD_CALL += 1
+    return call_id
+
+
+def _current_debug_forward_call() -> Optional[int]:
+    if not os.environ.get("NEMO_DP_DEBUG_DUMP"):
+        return None
+    return _NEMO_DEBUG_FORWARD_CALL - 1
+
+
+def _debug_tensor_stats(
+    call_id: Optional[int],
+    layer_id: Union[int, str],
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+    tag: Optional[str] = None,
+):
+    if call_id is None:
+        return
+    dump_dir = os.environ.get("NEMO_DP_DEBUG_DUMP")
+    if not dump_dir:
+        return
+    if torch.compiler.is_compiling():
+        return
+    if torch.cuda.is_available():
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return
+        except RuntimeError:
+            return
+
+    rank = get_tensor_model_parallel_rank()
+    dump_rank = int(os.environ.get("NEMO_DP_DEBUG_RANK", "0"))
+    if rank != dump_rank:
+        return
+
+    def summarize(t: Optional[torch.Tensor]):
+        if t is None:
+            return None
+        if t.numel() == 0:
+            return {"shape": list(t.shape), "dtype": str(t.dtype), "numel": 0}
+        x = t.detach().float()
+        flat = x.reshape(-1)
+        return {
+            "shape": list(t.shape),
+            "dtype": str(t.dtype),
+            "numel": int(t.numel()),
+            "sum": float(x.sum().item()),
+            "mean": float(x.mean().item()),
+            "abs_mean": float(x.abs().mean().item()),
+            "max": float(x.max().item()),
+            "min": float(x.min().item()),
+            "first8": [float(v) for v in flat[:8].cpu().tolist()],
+        }
+
+    def real_token_view(t: Optional[torch.Tensor]):
+        if t is None or t.numel() == 0:
+            return t
+        actual_tokens = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+        padded_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+        if (
+            actual_tokens is not None
+            and padded_tokens is not None
+            and t.shape[0] == sum(int(x) for x in padded_tokens)
+        ):
+            pieces = []
+            offset = 0
+            for actual, padded in zip(actual_tokens, padded_tokens):
+                actual = min(int(actual), int(padded))
+                padded = int(padded)
+                if actual > 0:
+                    pieces.append(t[offset : offset + actual])
+                offset += padded
+            if pieces:
+                return torch.cat(pieces, dim=0)
+            return t[:0]
+        num_token_non_padded_cpu = getattr(
+            forward_batch, "num_token_non_padded_cpu", None
+        )
+        if num_token_non_padded_cpu is not None:
+            return t[: min(t.shape[0], int(num_token_non_padded_cpu))]
+        return t
+
+    def local_real_token_view(t: Optional[torch.Tensor]):
+        if t is None or t.numel() == 0:
+            return t
+        actual_tokens = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+        padded_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+        if actual_tokens is None or padded_tokens is None:
+            return real_token_view(t)
+        if t.shape[0] == sum(int(x) for x in padded_tokens):
+            dp_rank = get_attention_tp_rank()
+            # Attention TP rank is not DP rank; use global TP rank modulo DP
+            # layout only for debug slicing. If shape is local rather than
+            # global, fall back below.
+            dp_size = len(padded_tokens)
+            dp_rank = min(rank // max(get_attention_tp_size(), 1), dp_size - 1)
+            start = sum(int(x) for x in padded_tokens[:dp_rank])
+            actual = min(int(actual_tokens[dp_rank]), int(padded_tokens[dp_rank]))
+            return t[start : start + actual]
+        num_token_non_padded_cpu = getattr(
+            forward_batch, "num_token_non_padded_cpu", None
+        )
+        if num_token_non_padded_cpu is not None:
+            return t[: min(t.shape[0], int(num_token_non_padded_cpu))]
+        return t
+
+    input_ids = getattr(forward_batch, "input_ids", None)
+    record = {
+        "call": call_id,
+        "layer": layer_id,
+        "rank": rank,
+        "tag": tag,
+        "mode": str(forward_batch.forward_mode),
+        "input_ids_shape": list(input_ids.shape) if input_ids is not None else None,
+        "num_token_non_padded_cpu": getattr(
+            forward_batch, "num_token_non_padded_cpu", None
+        ),
+        "global_num_tokens_cpu": getattr(forward_batch, "global_num_tokens_cpu", None),
+        "original_global_num_tokens_cpu": getattr(
+            forward_batch, "original_global_num_tokens_cpu", None
+        ),
+        "hidden": summarize(hidden_states),
+        "residual": summarize(residual),
+        "hidden_real": summarize(real_token_view(hidden_states)),
+        "residual_real": summarize(real_token_view(residual)),
+        "hidden_local_real": summarize(local_real_token_view(hidden_states)),
+        "residual_local_real": summarize(local_real_token_view(residual)),
+    }
+    os.makedirs(dump_dir, exist_ok=True)
+    with open(os.path.join(dump_dir, f"rank{rank}.jsonl"), "a") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+ATTN_LAYERS = (MAMBA, ATTENTION)
+
+
+def _is_sparse_layer(layer_type: str) -> bool:
+    return layer_type == MOE
+
+
+def _is_attn_layer(layer_type: str) -> bool:
+    return layer_type in ATTN_LAYERS
+
+
+def _get_real_num_tokens(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> int:
+    real_tokens = hidden_states.shape[0]
+    num_token_non_padded_cpu = getattr(
+        forward_batch, "num_token_non_padded_cpu", None
+    )
+    if num_token_non_padded_cpu is not None:
+        real_tokens = min(real_tokens, int(num_token_non_padded_cpu))
+    if (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_mixed()
+        and forward_batch.extend_seq_lens_cpu is not None
+    ):
+        real_tokens = min(real_tokens, int(sum(forward_batch.extend_seq_lens_cpu)))
+    return real_tokens
+
+
+def _zero_dp_padding_rows(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+    if real_tokens < hidden_states.shape[0]:
+        hidden_states[real_tokens:].zero_()
+    return hidden_states
+
+
+def _zero_dp_padding_rows_pair(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+    if real_tokens < hidden_states.shape[0]:
+        hidden_states[real_tokens:].zero_()
+        if residual is not None and residual.shape[0] == hidden_states.shape[0]:
+            residual[real_tokens:].zero_()
+    return hidden_states, residual
+
+
+def _zero_dp_global_padding_rows(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    actual_tokens = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+    padded_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if actual_tokens is None or padded_tokens is None:
+        return _zero_dp_padding_rows(hidden_states, forward_batch)
+
+    offset = 0
+    for actual, padded in zip(actual_tokens, padded_tokens):
+        actual = min(int(actual), int(padded))
+        padded = int(padded)
+        if offset + actual < hidden_states.shape[0]:
+            end = min(offset + padded, hidden_states.shape[0])
+            hidden_states[offset + actual : end].zero_()
+        offset += padded
+        if offset >= hidden_states.shape[0]:
+            break
+    return hidden_states
+
+
+def _pad_to_original_num_tokens(
+    output: torch.Tensor,
+    original_num_tokens: int,
+) -> torch.Tensor:
+    if output.shape[0] == original_num_tokens:
+        return output
+    padded = output.new_zeros((original_num_tokens, *output.shape[1:]))
+    padded[: output.shape[0]] = output
+    return padded
+
+
+def _build_layer_scatter_modes() -> LayerScatterModes:
+    # Nemotron-H uses attention/mamba as local-DP, attn-TP-partial producers.
+    # The following MLP/MoE layer is the only place that gathers/reduces that
+    # partial into the full TP layout before scattering back to the local DP slice.
+    return LayerScatterModes(
+        layer_input_mode=ScatterMode.TP_ATTN_FULL,
+        attn_mode=ScatterMode.TP_ATTN_FULL,
+        mlp_mode=ScatterMode.FULL,
+        middle_residual_mode=ScatterMode.TP_ATTN_FULL,
+        layer_output_mode=ScatterMode.TP_ATTN_FULL,
+    )
+
+
+def _make_layer_communicator(
+    layer_norm: RMSNorm,
+    *,
+    for_attn: bool,
+) -> LayerCommunicator:
+    return LayerCommunicator(
+        layer_scatter_modes=_build_layer_scatter_modes(),
+        input_layernorm=layer_norm if for_attn else nn.Identity(),
+        post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
+        # Keep residual+RMSNorm at the same per-token boundary as normal TP
+        # execution. The DP gather should move already-normalized tokens into the
+        # global MLP/MoE TP layout, not change the residual-add boundary.
+        force_layernorm_after_dp_gather=False,
+    )
 
 
 class NemotronHMLP(nn.Module):
@@ -311,6 +579,7 @@ class NemotronHMLPDecoderLayer(nn.Module):
 
         hybrid_override_pattern = config.hybrid_override_pattern
         mlp_index = hybrid_override_pattern[: layer_idx + 1].count("-") - 1
+        self.layer_idx = layer_idx
         if isinstance(config.intermediate_size, list):
             if len(config.intermediate_size) == 1:
                 intermediate_size = config.intermediate_size[0]
@@ -328,6 +597,9 @@ class NemotronHMLPDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.layer_communicator = _make_layer_communicator(
+            self.norm, for_attn=False
+        )
 
     def forward(
         self,
@@ -336,13 +608,67 @@ class NemotronHMLPDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_dp_attention_enabled():
+            hidden_states, residual = _zero_dp_padding_rows_pair(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.layer_idx if hasattr(self, "layer_idx") else "mlp",
+                hidden_states,
+                residual,
+                forward_batch,
+                tag="after_prepare_mlp",
+            )
+            hidden_states = _zero_dp_global_padding_rows(hidden_states, forward_batch)
+            hidden_states = self.mixer.forward(hidden_states)
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.layer_idx if hasattr(self, "layer_idx") else "mlp",
+                hidden_states,
+                residual,
+                forward_batch,
+                tag="after_mlp_mixer",
+            )
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.layer_idx if hasattr(self, "layer_idx") else "mlp",
+                hidden_states,
+                residual,
+                forward_batch,
+                tag="after_mlp_postprocess",
+            )
+            return hidden_states, residual
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
+        _debug_tensor_stats(
+            _current_debug_forward_call(),
+            self.layer_idx,
+            hidden_states,
+            residual,
+            forward_batch,
+            tag="after_prepare_mlp",
+        )
 
         hidden_states = self.mixer.forward(hidden_states)
+        _debug_tensor_stats(
+            _current_debug_forward_call(),
+            self.layer_idx,
+            hidden_states,
+            residual,
+            forward_batch,
+            tag="after_mlp_mixer",
+        )
         return hidden_states, residual
 
 
@@ -356,6 +682,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.layer_idx = layer_idx
         self.mixer = NemotronHMoE(
             config,
             layer_idx=layer_idx,
@@ -364,6 +691,9 @@ class NemotronHMoEDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.layer_communicator = _make_layer_communicator(
+            self.norm, for_attn=False
+        )
 
     def forward(
         self,
@@ -372,13 +702,67 @@ class NemotronHMoEDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_dp_attention_enabled():
+            hidden_states, residual = _zero_dp_padding_rows_pair(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.layer_idx if hasattr(self, "layer_idx") else "mlp",
+                hidden_states,
+                residual,
+                forward_batch,
+                tag="after_prepare_mlp",
+            )
+            hidden_states = _zero_dp_global_padding_rows(hidden_states, forward_batch)
+            hidden_states = self.mixer.forward(hidden_states)
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.layer_idx if hasattr(self, "layer_idx") else "mlp",
+                hidden_states,
+                residual,
+                forward_batch,
+                tag="after_mlp_mixer",
+            )
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.layer_idx if hasattr(self, "layer_idx") else "mlp",
+                hidden_states,
+                residual,
+                forward_batch,
+                tag="after_mlp_postprocess",
+            )
+            return hidden_states, residual
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
+        _debug_tensor_stats(
+            _current_debug_forward_call(),
+            self.layer_idx,
+            hidden_states,
+            residual,
+            forward_batch,
+            tag="after_prepare_mlp",
+        )
 
         hidden_states = self.mixer.forward(hidden_states)
+        _debug_tensor_stats(
+            _current_debug_forward_call(),
+            self.layer_idx,
+            hidden_states,
+            residual,
+            forward_batch,
+            tag="after_mlp_mixer",
+        )
         return hidden_states, residual
 
 
@@ -406,11 +790,22 @@ class NemotronHMambaDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.layer_communicator = _make_layer_communicator(
+            self.norm, for_attn=True
+        )
+        self.prev_layer_is_attn = layer_idx > 0 and _is_attn_layer(
+            config.hybrid_override_pattern[layer_idx - 1]
+        )
 
     def _forward_mamba(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         """Core Mamba forward logic, called directly or via split op."""
+        original_num_tokens = hidden_states.shape[0]
+        if forward_batch.forward_mode.is_extend():
+            real_num_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+            if real_num_tokens < original_num_tokens:
+                hidden_states = hidden_states[:real_num_tokens]
         output = torch.empty_like(hidden_states)
         attn_backend = forward_batch.attn_backend
         assert isinstance(attn_backend, HybridLinearAttnBackend)
@@ -422,7 +817,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
             output=output,
             use_triton_causal_conv=True,
         )
-        return output
+        return _pad_to_original_num_tokens(output, original_num_tokens)
 
     def forward(
         self,
@@ -431,11 +826,59 @@ class NemotronHMambaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_dp_attention_enabled():
+            if self.prev_layer_is_attn and residual is not None:
+                hidden_states = attn_tp_all_reduce(hidden_states)
+            hidden_states, residual = _zero_dp_padding_rows_pair(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.layer_id,
+                hidden_states,
+                residual,
+                forward_batch,
+                tag="after_prepare_attn",
+            )
+            if (
+                forward_batch.forward_mode.is_idle()
+                or _get_real_num_tokens(hidden_states, forward_batch) == 0
+            ):
+                return torch.zeros_like(hidden_states), residual
+
+            # DP-attention may carry per-DP padding rows while Mamba metadata is
+            # built from real token counts. The CUDA graph custom op bypasses
+            # the Python path that trims real tokens and restores padded shape,
+            # so keep DP-attention on the explicit forward until the graph op
+            # learns the same padding contract.
+            output = self._forward_mamba(hidden_states, forward_batch)
+            output = _zero_dp_padding_rows(output, forward_batch)
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.layer_id,
+                output,
+                residual,
+                forward_batch,
+                tag="after_attn_mixer",
+            )
+            return output, residual
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
+        _debug_tensor_stats(
+            _current_debug_forward_call(),
+            self.layer_id,
+            hidden_states,
+            residual,
+            forward_batch,
+            tag="after_prepare_attn",
+        )
 
         if is_in_breakable_cuda_graph():
             output = torch.empty_like(hidden_states)
@@ -448,6 +891,14 @@ class NemotronHMambaDecoderLayer(nn.Module):
             return output, residual
         else:
             output = self._forward_mamba(hidden_states, forward_batch)
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.layer_id,
+                output,
+                residual,
+                forward_batch,
+                tag="after_attn_mixer",
+            )
             return output, residual
 
 
@@ -461,7 +912,8 @@ class NemotronHAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_attention_tp_rank()
+        tp_size = get_attention_tp_size()
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -490,15 +942,26 @@ class NemotronHAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             prefix=f"{prefix}.qkv_proj",
         )
+        if is_dp_attention_enabled() and os.environ.get(
+            "NEMO_DP_EMULATE_QKV_CHUNKS", "0"
+        ) == "1":
+            self.qkv_proj.emulate_global_tp_chunks = True
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            reduce_results=not is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
         )
+        if is_dp_attention_enabled():
+            self.o_proj.emulate_global_tp_chunks = True
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -513,10 +976,45 @@ class NemotronHAttention(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self.attn.forward(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        if not is_dp_attention_enabled():
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn.forward(q, k, v, forward_batch)
+            output, _ = self.o_proj(attn_output)
+            return output
+
+        padded_shape = hidden_states.shape[0]
+        real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+        original_out_cache_loc = forward_batch.out_cache_loc
+        trim_for_attention = real_tokens < padded_shape
+        trim_q_for_attention = trim_for_attention and not forward_batch.forward_mode.is_decode()
+        if trim_for_attention and original_out_cache_loc is not None:
+            # Fake DP padding rows must not write KV cache. Decode wrappers are
+            # still built for the padded batch, so keep Q padded for decode but
+            # trim K/V and cache locations to real rows.
+            forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
+
+        try:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if trim_for_attention:
+                k = k[:real_tokens]
+                v = v[:real_tokens]
+                if trim_q_for_attention:
+                    q = q[:real_tokens]
+            attn_output = self.attn.forward(q, k, v, forward_batch)
+            if trim_q_for_attention:
+                padded_attn_output = attn_output.new_zeros(
+                    (padded_shape, attn_output.shape[1])
+                )
+                padded_attn_output[:real_tokens].copy_(attn_output)
+                attn_output = padded_attn_output
+            output, _ = self.o_proj(attn_output)
+        finally:
+            forward_batch.out_cache_loc = original_out_cache_loc
+
+        if output.shape[0] > real_tokens:
+            output[real_tokens:].zero_()
         return output
 
 
@@ -538,6 +1036,12 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.layer_communicator = _make_layer_communicator(
+            self.norm, for_attn=True
+        )
+        self.prev_layer_is_attn = layer_idx > 0 and _is_attn_layer(
+            config.hybrid_override_pattern[layer_idx - 1]
+        )
 
     def forward(
         self,
@@ -546,14 +1050,60 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_dp_attention_enabled():
+            if self.prev_layer_is_attn and residual is not None:
+                hidden_states = attn_tp_all_reduce(hidden_states)
+            hidden_states, residual = _zero_dp_padding_rows_pair(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.mixer.attn.layer_id if hasattr(self.mixer, "attn") else "attn",
+                hidden_states,
+                residual,
+                forward_batch,
+                tag="after_prepare_attn",
+            )
+            hidden_states = self.mixer.forward(
+                hidden_states=hidden_states, forward_batch=forward_batch
+            )
+            _debug_tensor_stats(
+                _current_debug_forward_call(),
+                self.mixer.attn.layer_id if hasattr(self.mixer, "attn") else "attn",
+                hidden_states,
+                residual,
+                forward_batch,
+                tag="after_attn_mixer",
+            )
+            return hidden_states, residual
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
+        _debug_tensor_stats(
+            _current_debug_forward_call(),
+            self.mixer.attn.layer_id if hasattr(self.mixer, "attn") else "attn",
+            hidden_states,
+            residual,
+            forward_batch,
+            tag="after_prepare_attn",
+        )
 
         hidden_states = self.mixer.forward(
             hidden_states=hidden_states, forward_batch=forward_batch
+        )
+        _debug_tensor_stats(
+            _current_debug_forward_call(),
+            self.mixer.attn.layer_id if hasattr(self.mixer, "attn") else "attn",
+            hidden_states,
+            residual,
+            forward_batch,
+            tag="after_attn_mixer",
         )
         return hidden_states, residual
 
@@ -598,6 +1148,7 @@ class NemotronHModel(nn.Module):
                 self.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -637,6 +1188,7 @@ class NemotronHModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        debug_call_id = _next_debug_forward_call()
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if not isinstance(layer, Layers):
@@ -646,12 +1198,16 @@ class NemotronHModel(nn.Module):
                 residual=residual,
                 forward_batch=forward_batch,
             )
+            _debug_tensor_stats(
+                debug_call_id, i, hidden_states, residual, forward_batch
+            )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
+        _debug_tensor_stats(debug_call_id, "norm_f", hidden_states, None, forward_batch)
         return hidden_states
 
 
@@ -726,6 +1282,7 @@ class NemotronHForCausalLM(nn.Module):
                         else lora_config.lora_vocab_padding_size
                     ),
                     quant_config=quant_config,
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

@@ -50,7 +50,19 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     elif not isinstance(chat_template_kwargs, dict):
         raise ValueError("chat_template_kwargs must be a dict or a JSON object string")
 
-    chat_template_kwargs = {**get_thinking_kwargs(args), **chat_template_kwargs}
+    thinking_kwargs = get_thinking_kwargs(args)
+    default_chat_template_kwargs = {}
+    if getattr(args, "eval_name", None) == "aime25" and not thinking_kwargs:
+        has_explicit_thinking = any(
+            key in chat_template_kwargs for key in ("thinking", "enable_thinking")
+        )
+        if not has_explicit_thinking:
+            default_chat_template_kwargs["thinking"] = True
+    chat_template_kwargs = {
+        **default_chat_template_kwargs,
+        **thinking_kwargs,
+        **chat_template_kwargs,
+    }
 
     extra_body = {}
     if chat_template_kwargs:
@@ -61,10 +73,18 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         if value is not None:
             extra_body[param_name] = value
 
+    eval_name = getattr(args, "eval_name", None)
+    max_tokens = getattr(args, "max_tokens", None)
+    if max_tokens is None and eval_name != "aime25":
+        max_tokens = 2048
+    top_p = getattr(args, "top_p", None)
+    if top_p is None:
+        top_p = 0.95 if eval_name == "aime25" else 1.0
+
     common_kwargs = dict(
         model=getattr(args, "model", None),
-        max_tokens=getattr(args, "max_tokens", 2048),
-        top_p=getattr(args, "top_p", 1.0),
+        max_tokens=max_tokens,
+        top_p=top_p,
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
     )
@@ -308,9 +328,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument(
         "--top-k", type=int, default=None, help="Top-k sampling parameter"
     )

@@ -1,4 +1,6 @@
 import logging
+import json
+import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -18,6 +20,11 @@ from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNor
 from sglang.srt.layers.attention.mamba.ops import (
     mamba_chunk_scan_combined,
     selective_state_update,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -59,6 +66,181 @@ elif is_npu():
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 
 logger = logging.getLogger(__name__)
+
+_MAMBA_DEBUG_CALLS: dict[str, int] = {}
+
+
+def _is_mamba_debug_capture_safe(tensor: torch.Tensor) -> bool:
+    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
+    if is_compiling is not None and is_compiling():
+        return False
+    if tensor.is_cuda and torch.cuda.is_available():
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+        except RuntimeError:
+            return False
+    return True
+
+
+def _next_mamba_debug_call(prefix: str) -> int:
+    call = _MAMBA_DEBUG_CALLS.get(prefix, 0)
+    _MAMBA_DEBUG_CALLS[prefix] = call + 1
+    return call
+
+
+def _mamba_debug_dump_dir(prefix: str) -> Optional[str]:
+    dump_dir = os.environ.get("NEMO_MAMBA_DEBUG_DUMP") or os.environ.get(
+        "NEMO_DP_DEBUG_DUMP"
+    )
+    if not dump_dir:
+        return None
+
+    prefix_filter = os.environ.get("NEMO_MAMBA_DEBUG_PREFIX", "model.layers.0.mixer")
+    if prefix_filter and prefix_filter not in prefix:
+        return None
+
+    rank_filter = os.environ.get("NEMO_MAMBA_DEBUG_RANK") or os.environ.get(
+        "NEMO_DP_DEBUG_RANK"
+    )
+    rank = get_tensor_model_parallel_rank()
+    if (
+        rank_filter is not None
+        and rank_filter.lower() != "all"
+        and rank != int(rank_filter)
+    ):
+        return None
+    return dump_dir
+
+
+@torch.no_grad()
+def _debug_mamba_tensor(
+    prefix: str,
+    tag: str,
+    tensor: torch.Tensor,
+    *,
+    call: int,
+    meta: Optional[dict] = None,
+) -> None:
+    dump_dir = _mamba_debug_dump_dir(prefix)
+    if dump_dir is None or not _is_mamba_debug_capture_safe(tensor):
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+
+    data = tensor.detach()
+    finite = torch.isfinite(data) if data.numel() else None
+    if data.numel() and finite.any():
+        values = data[finite].float()
+        stats = {
+            "mean": values.mean().item(),
+            "abs_mean": values.abs().mean().item(),
+            "amax": values.abs().max().item(),
+            "sum": values.sum().item(),
+            "l2": torch.linalg.vector_norm(values).item(),
+            "finite": int(finite.sum().item()),
+        }
+    else:
+        stats = {
+            "mean": 0.0,
+            "abs_mean": 0.0,
+            "amax": 0.0,
+            "sum": 0.0,
+            "l2": 0.0,
+            "finite": 0,
+        }
+
+    if data.ndim >= 2 and data.shape[0] > 0:
+        row0 = data[:1]
+    else:
+        row0 = data
+    row0_finite = torch.isfinite(row0) if row0.numel() else None
+    if row0.numel() and row0_finite.any():
+        row0_values = row0[row0_finite].float()
+        row0_stats = {
+            "row0_mean": row0_values.mean().item(),
+            "row0_abs_mean": row0_values.abs().mean().item(),
+            "row0_amax": row0_values.abs().max().item(),
+            "row0_sum": row0_values.sum().item(),
+            "row0_l2": torch.linalg.vector_norm(row0_values).item(),
+            "row0_finite": int(row0_finite.sum().item()),
+        }
+    else:
+        row0_stats = {
+            "row0_mean": 0.0,
+            "row0_abs_mean": 0.0,
+            "row0_amax": 0.0,
+            "row0_sum": 0.0,
+            "row0_l2": 0.0,
+            "row0_finite": 0,
+        }
+
+    record = {
+        "prefix": prefix,
+        "tag": tag,
+        "call": call,
+        "rank": get_tensor_model_parallel_rank(),
+        "attn_tp_rank": get_attention_tp_rank() if is_dp_attention_enabled() else None,
+        "attn_tp_size": get_attention_tp_size() if is_dp_attention_enabled() else None,
+        "shape": list(data.shape),
+        "dtype": str(data.dtype),
+        "sample": [v.item() for v in data.flatten()[:8].float()],
+        **stats,
+        **row0_stats,
+    }
+    if meta:
+        record.update(meta)
+
+    if os.environ.get("NEMO_MAMBA_DEBUG_SAVE_TENSOR", "0") == "1":
+        safe_prefix = prefix.replace(".", "_").replace("/", "_")
+        tensor_name = f"mamba_rank{get_tensor_model_parallel_rank()}_{safe_prefix}_call{call:04d}_{tag}.pt"
+        torch.save(data.cpu(), os.path.join(dump_dir, tensor_name))
+
+    with open(
+        os.path.join(dump_dir, f"mamba_rank{get_tensor_model_parallel_rank()}.jsonl"),
+        "a",
+        encoding="utf-8",
+    ) as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _first_global_tp_chunk(tensor: torch.Tensor, chunks: int) -> torch.Tensor:
+    if chunks <= 1 or tensor.shape[-1] % chunks != 0:
+        return tensor
+    return tensor.tensor_split(chunks, dim=-1)[0]
+
+
+def _debug_mamba_tensor_chunks(
+    prefix: str,
+    tag_base: str,
+    tensor: torch.Tensor,
+    chunks: int,
+    *,
+    call: int,
+    meta: Optional[dict] = None,
+) -> None:
+    if (
+        os.environ.get("NEMO_MAMBA_DEBUG_ALL_CHUNKS", "0") == "1"
+        and chunks > 1
+        and tensor.shape[-1] % chunks == 0
+    ):
+        for chunk_idx, chunk in enumerate(tensor.tensor_split(chunks, dim=-1)):
+            chunk_meta = dict(meta or {})
+            chunk_meta["chunk_idx"] = chunk_idx
+            _debug_mamba_tensor(
+                prefix,
+                f"{tag_base}_chunk{chunk_idx}",
+                chunk,
+                call=call,
+                meta=chunk_meta,
+            )
+    else:
+        _debug_mamba_tensor(
+            prefix,
+            f"{tag_base}_chunk0",
+            _first_global_tp_chunk(tensor, chunks),
+            call=call,
+            meta=meta,
+        )
 
 
 def mamba_v2_sharded_weight_loader(
@@ -208,8 +390,12 @@ class MambaMixer2(torch.nn.Module):
         #   may be replicated to follow the head shard.
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        if is_dp_attention_enabled():
+            self.tp_size = get_attention_tp_size()
+            self.tp_rank = get_attention_tp_rank()
+        else:
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_rank = get_tensor_model_parallel_rank()
 
         self.num_heads = num_heads = cache_params.shape.num_heads
         self.head_dim = cache_params.shape.head_dim
@@ -258,6 +444,8 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_conv_bias,
                 quant_config=None,
                 prefix=f"{prefix}.conv1d",
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
             )
 
             self.in_proj = MergedColumnParallelLinear(
@@ -272,7 +460,13 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
             )
+            if is_dp_attention_enabled() and os.environ.get(
+                "NEMO_DP_EMULATE_MAMBA_IN_PROJ_CHUNKS", "0"
+            ) == "1":
+                self.in_proj.emulate_global_tp_chunks = True
         else:
             # This is the n_groups == 1 case,
             # where we need to duplicate groups if TP>1.
@@ -283,6 +477,8 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_conv_bias,
                 quant_config=None,
                 prefix=f"{prefix}.conv1d",
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
             )
 
             self.in_proj = ColumnParallelLinear(
@@ -291,7 +487,13 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
             )
+            if is_dp_attention_enabled() and os.environ.get(
+                "NEMO_DP_EMULATE_MAMBA_IN_PROJ_CHUNKS", "0"
+            ) == "1":
+                self.in_proj.emulate_global_tp_chunks = True
 
             # - because in_proj is a concatenation of 3 weights, we
             #   need to interleave them before sharding
@@ -394,8 +596,13 @@ class MambaMixer2(torch.nn.Module):
             bias=use_bias,
             input_is_parallel=True,
             quant_config=quant_config,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            reduce_results=not is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
         )
+        if is_dp_attention_enabled():
+            self.out_proj.emulate_global_tp_chunks = True
 
         self.norm = Mixer2RMSNormGated(
             intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
@@ -422,6 +629,23 @@ class MambaMixer2(torch.nn.Module):
         ssm_state = layer_cache.temporal
 
         query_start_loc = metadata.query_start_loc
+
+        debug_enabled = _mamba_debug_dump_dir(self.prefix) is not None
+        debug_call = _next_mamba_debug_call(self.prefix) if debug_enabled else -1
+        global_tp_size = get_tensor_model_parallel_world_size()
+        global_tp_chunks = 1
+        if (
+            is_dp_attention_enabled()
+            and global_tp_size > self.tp_size
+            and global_tp_size % self.tp_size == 0
+        ):
+            global_tp_chunks = global_tp_size // self.tp_size
+
+        # DP attention can pad hidden_states for collective alignment. Keep the
+        # padded projection/gate shape, run kernels only on real tokens, then run
+        # norm/out_proj on the padded shape so the next collective sees the same
+        # row count as the layer input.
+        padded_num_tokens = hidden_states.shape[0]
 
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
@@ -464,7 +688,78 @@ class MambaMixer2(torch.nn.Module):
         has_prefill = num_prefills > 0
         has_decode = num_decodes > 0
         num_actual_tokens = num_prefill_tokens + num_decode_tokens
-        assert num_actual_tokens == projected_states.shape[0]
+        assert num_actual_tokens <= projected_states.shape[0]
+        hidden_states_B_C = hidden_states_B_C[:num_actual_tokens]
+        dt = dt[:num_actual_tokens]
+
+        local_num_heads = self.num_heads // self.tp_size
+        local_num_groups = self.n_groups // self.tp_size
+        use_virtual_ssm = (
+            os.environ.get("NEMO_DP_MAMBA_VIRTUAL_SSM", "0") == "1"
+            and global_tp_chunks > 1
+            and local_num_heads % global_tp_chunks == 0
+            and local_num_groups % global_tp_chunks == 0
+            and not metadata.is_target_verify
+        )
+
+        if debug_enabled:
+            debug_meta = {
+                "global_tp_size": global_tp_size,
+                "local_tp_size": self.tp_size,
+                "global_tp_chunks": global_tp_chunks,
+                "padded_num_tokens": padded_num_tokens,
+                "num_actual_tokens": num_actual_tokens,
+                "num_prefill_tokens": num_prefill_tokens,
+                "num_decode_tokens": num_decode_tokens,
+            }
+            hbc_x, hbc_b, hbc_c = split_hidden_states_B_C_fn(hidden_states_B_C)
+            _debug_mamba_tensor(
+                self.prefix,
+                "input",
+                hidden_states[:num_actual_tokens],
+                call=debug_call,
+                meta=debug_meta,
+            )
+            _debug_mamba_tensor_chunks(
+                self.prefix,
+                "gate",
+                gate[:num_actual_tokens],
+                global_tp_chunks,
+                call=debug_call,
+                meta=debug_meta,
+            )
+            _debug_mamba_tensor_chunks(
+                self.prefix,
+                "in_x",
+                hbc_x,
+                global_tp_chunks,
+                call=debug_call,
+                meta=debug_meta,
+            )
+            _debug_mamba_tensor_chunks(
+                self.prefix,
+                "in_b",
+                hbc_b,
+                global_tp_chunks,
+                call=debug_call,
+                meta=debug_meta,
+            )
+            _debug_mamba_tensor_chunks(
+                self.prefix,
+                "in_c",
+                hbc_c,
+                global_tp_chunks,
+                call=debug_call,
+                meta=debug_meta,
+            )
+            _debug_mamba_tensor_chunks(
+                self.prefix,
+                "dt",
+                dt,
+                global_tp_chunks,
+                call=debug_call,
+                meta=debug_meta,
+            )
 
         # NOTE: V0 put prefill before decode
         # Separate prefill and decode by splitting varlen input
@@ -479,27 +774,27 @@ class MambaMixer2(torch.nn.Module):
             [num_prefill_tokens, num_decode_tokens],
             dim=0,
         )
-        # Split along batch dimension
-        state_indices_tensor_p, state_indices_tensor_d = torch.split(
-            state_indices_tensor,
-            [num_prefills, num_decodes],
-            dim=0,
-        )
+        # Split along the real batch dimension. DP-attention may pad
+        # state_indices_tensor beyond num_prefills + num_decodes for collective
+        # alignment; fake decode rows must not update Mamba states.
+        state_indices_tensor_p = state_indices_tensor[:num_prefills]
+        state_indices_tensor_d = state_indices_tensor[
+            num_prefills : num_prefills + num_decodes
+        ]
         query_start_loc_p = query_start_loc[: num_prefills + 1] if has_prefill else None
 
         # Preallocate output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
 
-        preallocated_ssm_out = torch.empty(
+        preallocated_ssm_out = hidden_states.new_zeros(
             [
                 projected_states.shape[0],
                 (self.num_heads * self.head_dim) // self.tp_size,
-            ],
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            ]
         )
+        preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
-            preallocated_ssm_out,
+            preallocated_ssm_out_active,
             [num_prefill_tokens, num_decode_tokens],
             dim=0,
         )
@@ -535,6 +830,31 @@ class MambaMixer2(torch.nn.Module):
             ).transpose(0, 1)[:num_prefill_tokens]
 
             hidden_states_p, B_p, C_p = split_hidden_states_B_C_fn(hidden_states_B_C_p)
+            if debug_enabled:
+                _debug_mamba_tensor_chunks(
+                    self.prefix,
+                    "conv_x_p",
+                    hidden_states_p,
+                    global_tp_chunks,
+                    call=debug_call,
+                    meta=debug_meta,
+                )
+                _debug_mamba_tensor_chunks(
+                    self.prefix,
+                    "conv_b_p",
+                    B_p,
+                    global_tp_chunks,
+                    call=debug_call,
+                    meta=debug_meta,
+                )
+                _debug_mamba_tensor_chunks(
+                    self.prefix,
+                    "conv_c_p",
+                    C_p,
+                    global_tp_chunks,
+                    call=debug_call,
+                    meta=debug_meta,
+                )
 
             # 3. State Space Model sequence transformation
             initial_states = None
@@ -546,36 +866,105 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             # NOTE: final output is an in-place update of out tensor
-            varlen_state = mamba_chunk_scan_combined(
-                hidden_states_p.view(
-                    1, num_prefill_tokens, self.num_heads // self.tp_size, self.head_dim
-                ),
-                dt_p.unsqueeze(0),
-                self.A,
-                B_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
-                C_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
-                chunk_size=mixed_metadata.chunk_size,
-                D=self.D,
-                z=None,
-                dt_bias=self.dt_bias,
-                seq_idx=mixed_metadata.seq_idx,
-                chunk_indices=mixed_metadata.chunk_indices,
-                chunk_offsets=mixed_metadata.chunk_offsets,
-                cu_seqlens=query_start_loc_p,
-                initial_states=initial_states,
-                return_varlen_states=True,
-                return_final_states=False,
-                dt_softplus=True,
-                dt_limit=(0.0, float("inf")),
-                out=preallocated_ssm_out_p.view(
-                    1, num_prefill_tokens, -1, self.head_dim
-                ),
-                state_dtype=ssm_state.dtype,
-            )
+            if use_virtual_ssm:
+                heads_per_chunk = local_num_heads // global_tp_chunks
+                groups_per_chunk = local_num_groups // global_tp_chunks
+                hidden_states_p_view = hidden_states_p.view(
+                    1, num_prefill_tokens, local_num_heads, self.head_dim
+                )
+                B_p_view = B_p.view(
+                    1, num_prefill_tokens, local_num_groups, -1
+                )
+                C_p_view = C_p.view(
+                    1, num_prefill_tokens, local_num_groups, -1
+                )
+                out_p_view = preallocated_ssm_out_p.view(
+                    1, num_prefill_tokens, local_num_heads, self.head_dim
+                )
+                for chunk_idx in range(global_tp_chunks):
+                    h_start = chunk_idx * heads_per_chunk
+                    h_end = h_start + heads_per_chunk
+                    g_start = chunk_idx * groups_per_chunk
+                    g_end = g_start + groups_per_chunk
+                    initial_states_chunk = (
+                        None
+                        if initial_states is None
+                        else initial_states[:, h_start:h_end].contiguous()
+                    )
+                    chunk_out = torch.empty(
+                        (1, num_prefill_tokens, heads_per_chunk, self.head_dim),
+                        dtype=preallocated_ssm_out_p.dtype,
+                        device=preallocated_ssm_out_p.device,
+                    )
+                    varlen_state_chunk = mamba_chunk_scan_combined(
+                        hidden_states_p_view[:, :, h_start:h_end, :].contiguous(),
+                        dt_p[:, h_start:h_end].contiguous().unsqueeze(0),
+                        self.A[h_start:h_end].contiguous(),
+                        B_p_view[:, :, g_start:g_end, :].contiguous(),
+                        C_p_view[:, :, g_start:g_end, :].contiguous(),
+                        chunk_size=mixed_metadata.chunk_size,
+                        D=self.D[h_start:h_end].contiguous(),
+                        z=None,
+                        dt_bias=self.dt_bias[h_start:h_end].contiguous(),
+                        seq_idx=mixed_metadata.seq_idx,
+                        chunk_indices=mixed_metadata.chunk_indices,
+                        chunk_offsets=mixed_metadata.chunk_offsets,
+                        cu_seqlens=query_start_loc_p,
+                        initial_states=initial_states_chunk,
+                        return_varlen_states=True,
+                        return_final_states=False,
+                        dt_softplus=True,
+                        dt_limit=(0.0, float("inf")),
+                        out=chunk_out,
+                        state_dtype=ssm_state.dtype,
+                    )
+                    out_p_view[:, :, h_start:h_end, :].copy_(chunk_out)
+                    ssm_state[state_indices_tensor_p, h_start:h_end, :, :] = (
+                        varlen_state_chunk
+                    )
+                varlen_state = None
+            else:
+                varlen_state = mamba_chunk_scan_combined(
+                    hidden_states_p.view(
+                        1, num_prefill_tokens, local_num_heads, self.head_dim
+                    ),
+                    dt_p.unsqueeze(0),
+                    self.A,
+                    B_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                    C_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                    chunk_size=mixed_metadata.chunk_size,
+                    D=self.D,
+                    z=None,
+                    dt_bias=self.dt_bias,
+                    seq_idx=mixed_metadata.seq_idx,
+                    chunk_indices=mixed_metadata.chunk_indices,
+                    chunk_offsets=mixed_metadata.chunk_offsets,
+                    cu_seqlens=query_start_loc_p,
+                    initial_states=initial_states,
+                    return_varlen_states=True,
+                    return_final_states=False,
+                    dt_softplus=True,
+                    dt_limit=(0.0, float("inf")),
+                    out=preallocated_ssm_out_p.view(
+                        1, num_prefill_tokens, -1, self.head_dim
+                    ),
+                    state_dtype=ssm_state.dtype,
+                )
+
+            if debug_enabled:
+                _debug_mamba_tensor_chunks(
+                    self.prefix,
+                    "ssm_p",
+                    preallocated_ssm_out_p,
+                    global_tp_chunks,
+                    call=debug_call,
+                    meta=debug_meta,
+                )
 
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
-            ssm_state[state_indices_tensor_p] = varlen_state
+            if varlen_state is not None:
+                ssm_state[state_indices_tensor_p] = varlen_state
 
         # Process decode requests
         if has_decode:
@@ -631,9 +1020,34 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             hidden_states_d, B_d, C_d = split_hidden_states_B_C_fn(hidden_states_B_C_d)
+            if debug_enabled:
+                _debug_mamba_tensor_chunks(
+                    self.prefix,
+                    "conv_x_d",
+                    hidden_states_d,
+                    global_tp_chunks,
+                    call=debug_call,
+                    meta=debug_meta,
+                )
+                _debug_mamba_tensor_chunks(
+                    self.prefix,
+                    "conv_b_d",
+                    B_d,
+                    global_tp_chunks,
+                    call=debug_call,
+                    meta=debug_meta,
+                )
+                _debug_mamba_tensor_chunks(
+                    self.prefix,
+                    "conv_c_d",
+                    C_d,
+                    global_tp_chunks,
+                    call=debug_call,
+                    meta=debug_meta,
+                )
 
             # 3. State Space Model sequence transformation
-            n_groups = self.n_groups // self.tp_size
+            n_groups = local_num_groups
             A_d = (
                 self.A[:, None, ...][:, :, None]
                 .expand(-1, self.head_dim, self.ssm_state_size)
@@ -645,7 +1059,7 @@ class MambaMixer2(torch.nn.Module):
             B_d = B_d.view(-1, n_groups, B_d.shape[1] // n_groups)
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
             hidden_states_d = hidden_states_d.view(
-                -1, self.num_heads // self.tp_size, self.head_dim
+                -1, local_num_heads, self.head_dim
             )
 
             if is_target_verify:
@@ -684,29 +1098,86 @@ class MambaMixer2(torch.nn.Module):
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
             else:
-                selective_state_update(
-                    ssm_state,
-                    hidden_states_d,
-                    dt_d,
-                    A_d,
-                    B_d,
-                    C_d,
-                    D_d,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_tensor_d,
-                    out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                if use_virtual_ssm:
+                    heads_per_chunk = local_num_heads // global_tp_chunks
+                    groups_per_chunk = local_num_groups // global_tp_chunks
+                    out_d_view = preallocated_ssm_out_d.view(
+                        num_decodes, local_num_heads, self.head_dim
+                    )
+                    for chunk_idx in range(global_tp_chunks):
+                        h_start = chunk_idx * heads_per_chunk
+                        h_end = h_start + heads_per_chunk
+                        g_start = chunk_idx * groups_per_chunk
+                        g_end = g_start + groups_per_chunk
+                        chunk_state = ssm_state[:, h_start:h_end, :, :].contiguous()
+                        chunk_out = torch.empty(
+                            (num_decodes, heads_per_chunk, self.head_dim),
+                            dtype=preallocated_ssm_out_d.dtype,
+                            device=preallocated_ssm_out_d.device,
+                        )
+                        selective_state_update(
+                            chunk_state,
+                            hidden_states_d[:, h_start:h_end, :].contiguous(),
+                            dt_d[:, h_start:h_end, :].contiguous(),
+                            A_d[h_start:h_end].contiguous(),
+                            B_d[:, g_start:g_end, :].contiguous(),
+                            C_d[:, g_start:g_end, :].contiguous(),
+                            D_d[h_start:h_end].contiguous(),
+                            z=None,
+                            dt_bias=dt_bias[h_start:h_end].contiguous(),
+                            dt_softplus=True,
+                            state_batch_indices=state_indices_tensor_d,
+                            out=chunk_out,
+                        )
+                        ssm_state[:, h_start:h_end, :, :].copy_(chunk_state)
+                        out_d_view[:, h_start:h_end, :].copy_(chunk_out)
+                else:
+                    selective_state_update(
+                        ssm_state,
+                        hidden_states_d,
+                        dt_d,
+                        A_d,
+                        B_d,
+                        C_d,
+                        D_d,
+                        z=None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_indices_tensor_d,
+                        out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                    )
+            if debug_enabled:
+                _debug_mamba_tensor_chunks(
+                    self.prefix,
+                    "ssm_d",
+                    preallocated_ssm_out_d,
+                    global_tp_chunks,
+                    call=debug_call,
+                    meta=debug_meta,
                 )
 
         # 4. gated MLP
         # GatedRMSNorm internally applying SiLU to the gate
         # SiLU is applied internally before normalization, unlike standard
         # norm usage
-        hidden_states = self.norm(preallocated_ssm_out, gate[:num_actual_tokens])
+        hidden_states = self.norm(preallocated_ssm_out, gate)
+        if debug_enabled:
+            _debug_mamba_tensor_chunks(
+                self.prefix,
+                "norm",
+                hidden_states[:num_actual_tokens],
+                global_tp_chunks,
+                call=debug_call,
+                meta=debug_meta,
+            )
 
-        # 5. Final linear projection
-        output[:num_actual_tokens], _ = self.out_proj(hidden_states)
+        # 5. Final linear projection. Run out_proj on the padded shape so
+        # DP-attn collectives see the same row count as the layer input.
+        output[:padded_num_tokens], _ = self.out_proj(hidden_states)
+        if output.shape[0] > num_actual_tokens:
+            # Zero DP-attention padded rows so they do not carry uninitialized
+            # data (potentially NaN) into subsequent layers' residual additions.
+            output[num_actual_tokens:].zero_()
 
     @property
     def mamba_type(self) -> str:

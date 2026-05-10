@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -26,6 +27,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
+    get_attention_tp_size,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.parameter import (
@@ -467,7 +469,54 @@ class ColumnParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        emulate_global_tp_chunks = 1
+        if (
+            getattr(self, "emulate_global_tp_chunks", False)
+            and self.quant_method.__class__.__name__ == "UnquantizedLinearMethod"
+        ):
+            global_tp_size = get_tensor_model_parallel_world_size()
+            if global_tp_size > self.tp_size and global_tp_size % self.tp_size == 0:
+                emulate_global_tp_chunks = global_tp_size // self.tp_size
+
+        if emulate_global_tp_chunks > 1:
+            output_parts = []
+            output_offset = 0
+            for partition_size in self.output_partition_sizes:
+                if partition_size % emulate_global_tp_chunks != 0:
+                    output_parts = []
+                    break
+                weight_part = self.weight.narrow(0, output_offset, partition_size)
+                bias_part = (
+                    bias.narrow(0, output_offset, partition_size)
+                    if bias is not None
+                    else None
+                )
+                weight_chunks = weight_part.tensor_split(
+                    emulate_global_tp_chunks, dim=0
+                )
+                bias_chunks = (
+                    bias_part.tensor_split(emulate_global_tp_chunks, dim=0)
+                    if bias_part is not None
+                    else [None] * emulate_global_tp_chunks
+                )
+                output_parts.append(
+                    torch.cat(
+                        [
+                            torch.nn.functional.linear(input_, weight_chunk, bias_chunk)
+                            for weight_chunk, bias_chunk in zip(
+                                weight_chunks, bias_chunks
+                            )
+                        ],
+                        dim=-1,
+                    )
+                )
+                output_offset += partition_size
+            if output_parts:
+                output_parallel = torch.cat(output_parts, dim=-1)
+            else:
+                output_parallel = self.quant_method.apply(self, input_, bias)
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -1535,10 +1584,93 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
-        with symm_ctx:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        emulate_global_tp_chunks = 1
+        if (
+            getattr(self, "emulate_global_tp_chunks", False)
+            and self.quant_method.__class__.__name__ == "UnquantizedLinearMethod"
+        ):
+            global_tp_size = get_tensor_model_parallel_world_size()
+            if global_tp_size > self.tp_size and global_tp_size % self.tp_size == 0:
+                emulate_global_tp_chunks = global_tp_size // self.tp_size
 
-        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+        with symm_ctx:
+            if emulate_global_tp_chunks > 1:
+                input_chunks = input_parallel.tensor_split(
+                    emulate_global_tp_chunks, dim=-1
+                )
+                weight_chunks = self.weight.tensor_split(
+                    emulate_global_tp_chunks, dim=1
+                )
+                virtual_tp_allgather = (
+                    os.environ.get("NEMO_DP_VIRTUAL_TP_ROW_ALLGATHER", "0") == "1"
+                    and self.tp_size == get_attention_tp_size()
+                    and self.tp_size > 1
+                )
+                if virtual_tp_allgather:
+                    local_outputs = []
+                    for chunk_idx, (input_chunk, weight_chunk) in enumerate(
+                        zip(input_chunks, weight_chunks)
+                    ):
+                        local_outputs.append(
+                            torch.nn.functional.linear(
+                                input_chunk,
+                                weight_chunk,
+                                bias_ if chunk_idx == 0 else None,
+                            )
+                        )
+                    local_outputs = torch.stack(local_outputs, dim=0).contiguous()
+                    gathered_outputs = local_outputs.new_empty(
+                        (
+                            self.tp_size * emulate_global_tp_chunks,
+                            *local_outputs.shape[1:],
+                        )
+                    )
+                    get_attention_tp_group().all_gather_into_tensor(
+                        gathered_outputs, local_outputs
+                    )
+                    output_dtype = gathered_outputs.dtype
+                    output_parallel = gathered_outputs.float().sum(dim=0).to(output_dtype)
+                    output_parallel._sglang_attn_tp_reduced = True
+                else:
+                    output_parallel = torch.nn.functional.linear(
+                        input_chunks[0],
+                        weight_chunks[0],
+                        bias_,
+                    )
+                    if os.environ.get("NEMO_DP_EMULATE_ROW_CHUNK_BF16_ACC", "0") == "1":
+                        # Emulate TP8 row-parallel accumulation more closely: each
+                        # virtual shard contributes in the module dtype instead of
+                        # fusing all local virtual shards in FP32 before the TP
+                        # collective. This is env-gated while validating DP4 parity.
+                        for input_chunk, weight_chunk in zip(
+                            input_chunks[1:], weight_chunks[1:]
+                        ):
+                            output_parallel = output_parallel + torch.nn.functional.linear(
+                                input_chunk,
+                                weight_chunk,
+                                None,
+                            )
+                    else:
+                        output_dtype = output_parallel.dtype
+                        output_parallel = output_parallel.float()
+                        for input_chunk, weight_chunk in zip(
+                            input_chunks[1:], weight_chunks[1:]
+                        ):
+                            output_parallel = output_parallel + torch.nn.functional.linear(
+                                input_chunk,
+                                weight_chunk,
+                                None,
+                            ).float()
+                        output_parallel = output_parallel.to(output_dtype)
+            else:
+                output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+
+        if (
+            self.reduce_results
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and not getattr(output_parallel, "_sglang_attn_tp_reduced", False)
+        ):
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:

@@ -33,6 +33,14 @@ from sglang.jit_kernel.flash_attention import (
 )
 
 
+def _trim_cache_loc_to_kv(
+    cache_loc: torch.Tensor, k: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if k is not None and cache_loc is not None and cache_loc.shape[0] != k.shape[0]:
+        return cache_loc[: k.shape[0]]
+    return cache_loc
+
+
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -640,6 +648,7 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                cache_loc = _trim_cache_loc_to_kv(cache_loc, k)
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -1049,6 +1058,7 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                cache_loc = _trim_cache_loc_to_kv(cache_loc, k)
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale

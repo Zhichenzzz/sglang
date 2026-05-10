@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tp_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -198,8 +202,22 @@ def prepare_mlp_sync_batch_raw(
         local_forward_mode=local_forward_mode,
     )
 
+    debug_sched_dir = os.environ.get("NEMO_DP_DEBUG_SCHED")
+
     if not skip_all_gather:
         mlp_sync_info.all_gather(device=device, group=group)
+
+        if debug_sched_dir:
+            os.makedirs(debug_sched_dir, exist_ok=True)
+            rank = get_tensor_model_parallel_rank()
+            with open(os.path.join(debug_sched_dir, f"rank{rank}.log"), "a") as f:
+                f.write(
+                    f"local_num_tokens={num_tokens} "
+                    f"local_num_tokens_for_logprob={num_tokens_for_logprob} "
+                    f"local_forward_mode={local_forward_mode} "
+                    f"global_num_tokens={mlp_sync_info.global_num_tokens} "
+                    f"global_num_tokens_for_logprob={mlp_sync_info.global_num_tokens_for_logprob}\n"
+                )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(

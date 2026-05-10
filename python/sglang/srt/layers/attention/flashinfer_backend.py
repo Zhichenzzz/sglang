@@ -40,6 +40,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _trim_cache_loc_to_kv(
+    cache_loc: torch.Tensor, k: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if k is not None and cache_loc is not None and cache_loc.shape[0] != k.shape[0]:
+        return cache_loc[: k.shape[0]]
+    return cache_loc
+
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
@@ -802,6 +811,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
+                    cache_loc = _trim_cache_loc_to_kv(cache_loc, k)
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
@@ -884,6 +894,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
+                cache_loc = _trim_cache_loc_to_kv(cache_loc, k)
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
@@ -912,6 +923,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
+                cache_loc = _trim_cache_loc_to_kv(cache_loc, k)
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )

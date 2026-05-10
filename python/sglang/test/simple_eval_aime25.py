@@ -40,11 +40,13 @@ def normalize_aime_answer(answer: str) -> Optional[str]:
     """
     if answer is None:
         return None
-    # Remove whitespace and convert to string
     answer = str(answer).strip()
-    # Try to extract integer from answer
+    integer_match = re.search(r"(?<!\d)(\d{1,3})(?!\d)", answer)
+    if integer_match:
+        num = int(integer_match.group(1))
+        if 0 <= num <= 999:
+            return str(num)
     try:
-        # Handle various formats like "42", "042", "42.0", etc.
         num = int(float(answer))
         if 0 <= num <= 999:
             return str(num)
@@ -94,9 +96,9 @@ class AIME25Eval(Eval):
             response_text = sampler(prompt_messages)
             response_text = response_text or ""
 
-            # Extract answer from response
-            match = re.search(ANSWER_PATTERN, response_text)
-            extracted_answer = match.group(1).strip() if match else None
+            # Extract the final Answer: line; intermediate guesses can appear in reasoning.
+            matches = list(re.finditer(ANSWER_PATTERN, response_text))
+            extracted_answer = matches[-1].group(1).strip() if matches else None
 
             # Normalize both answers for comparison
             normalized_extracted = normalize_aime_answer(extracted_answer)

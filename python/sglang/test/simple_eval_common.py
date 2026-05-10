@@ -93,7 +93,7 @@ class ChatCompletionSampler(SamplerBase):
         temperature: float = 0.0,
         top_p: float = 1.0,
         reasoning_effort: Optional[str] = None,
-        max_tokens: int = 2048,
+        max_tokens: Optional[int] = 2048,
         extra_body: Optional[Dict[str, Any]] = None,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
@@ -143,15 +143,19 @@ class ChatCompletionSampler(SamplerBase):
         trial = 0
         while trial < 6:  # 126 seconds in total
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=message_list,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    max_tokens=self.max_tokens,
-                    reasoning_effort=self.reasoning_effort,
-                    extra_body=self.extra_body,
-                )
+                kwargs = {
+                    "model": self.model,
+                    "messages": message_list,
+                    "temperature": self.temperature,
+                    "top_p": self.top_p,
+                }
+                if self.max_tokens is not None:
+                    kwargs["max_tokens"] = self.max_tokens
+                if self.reasoning_effort is not None:
+                    kwargs["reasoning_effort"] = self.reasoning_effort
+                if self.extra_body is not None:
+                    kwargs["extra_body"] = self.extra_body
+                response = self.client.chat.completions.create(**kwargs)
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
                 return response.choices[0].message.content or ""
@@ -184,7 +188,7 @@ class CompletionSampler(SamplerBase):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_tokens: int = 2048,
+        max_tokens: Optional[int] = 2048,
         stop: Optional[List[str]] = None,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
@@ -215,14 +219,17 @@ class CompletionSampler(SamplerBase):
         trial = 0
         while trial < 6:
             try:
-                response = self.client.completions.create(
-                    model=self.model,
-                    prompt=prompt,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    max_tokens=self.max_tokens,
-                    stop=self.stop,
-                )
+                kwargs = {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "temperature": self.temperature,
+                    "top_p": self.top_p,
+                }
+                if self.max_tokens is not None:
+                    kwargs["max_tokens"] = self.max_tokens
+                if self.stop is not None:
+                    kwargs["stop"] = self.stop
+                response = self.client.completions.create(**kwargs)
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
                 return response.choices[0].text or ""
