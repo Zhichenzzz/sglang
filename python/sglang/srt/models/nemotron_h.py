@@ -628,6 +628,7 @@ class NemotronHAttention(nn.Module):
         keep_q_padded = (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_idle()
         )
         original_out_cache_loc = forward_batch.out_cache_loc
 
