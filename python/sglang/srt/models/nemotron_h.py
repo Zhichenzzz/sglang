@@ -619,10 +619,16 @@ class NemotronHAttention(nn.Module):
         # real cu_seqlens, so Q/K/V are trimmed to the real tokens; decode runs a
         # wrapper captured at the padded batch size, so Q stays padded while K/V
         # and the cache-write locations are trimmed.
+        # target_verify (spec/NEXTN) uses the SAME padded-batch wrapper as decode
+        # (qo_indptr is built at the padded length), so Q must stay padded there too —
+        # otherwise q.shape[0] (real) != qo_indptr[-1] (padded) in flashinfer prefill.
         padded_shape = hidden_states.shape[0]
         real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
         has_padding = real_tokens < padded_shape
-        keep_q_padded = forward_batch.forward_mode.is_decode()
+        keep_q_padded = (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
         original_out_cache_loc = forward_batch.out_cache_loc
 
         qkv, _ = self.qkv_proj(hidden_states)
