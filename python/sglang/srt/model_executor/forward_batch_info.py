@@ -962,7 +962,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend(include_v2=True)
             or self.forward_mode.is_idle()
         ):
-            if self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            if self.spec_info is not None and not self.spec_info.is_draft_input():
+                # Spec target-verify batch. Keep the num_tokens_per_req structure so
+                # every DP rank runs the SAME verify forward with identical collectives
+                # (the decode-style IDLE->EXTEND conversion below collapses verify's
+                # multi-token reqs and leaves idle ranks empty -> NCCL deadlock). An
+                # idle rank is promoted to TARGET_VERIFY; _pad_inputs_to_size then fills
+                # num_tokens fake rows / (num_tokens//ntpr) fake reqs whose req_pool
+                # indices drive generate_attn_arg_prefill (draft_token content is unused).
+                if self.forward_mode.is_idle():
+                    setattr(self, "_original_forward_mode", self.forward_mode)
+                    self.forward_mode = ForwardMode.TARGET_VERIFY
+                bs = self.batch_size = (
+                    num_tokens // self.spec_info.num_tokens_per_req
+                )
+            elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs
