@@ -577,6 +577,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret.num_token_non_padded_cpu = num_tokens
 
         # For MLP sync
+        if __import__("os").environ.get("DBG_GNT"):
+            try:
+                from sglang.srt.layers.dp_attention import get_attention_dp_rank as _gdr
+                print("[DBG_GNT] r=%s mode=%s gnt_in=%s spec=%s draftworker=%s" % (
+                    _gdr(), ret.forward_mode, batch.global_num_tokens,
+                    type(batch.spec_info).__name__ if batch.spec_info is not None else None,
+                    getattr(model_runner, "is_draft_worker", "?")), flush=True)
+            except Exception as _e:
+                print("[DBG_GNT] fail %s" % _e, flush=True)
         if batch.global_num_tokens is not None:
             assert batch.global_num_tokens_for_logprob is not None
 
@@ -979,15 +988,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
-                self.extend_num_tokens = bs
-                self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
-                self.extend_prefix_lens = self.seq_lens - 1
+                # MAX_LEN pads every rank to num_tokens single-token rows. Build the
+                # extend metadata for num_tokens rows: real reqs keep their (seq_len-1)
+                # prefix; padded/fake rows (ALL rows on an idle rank, whose seq_lens is
+                # empty and pre-pad bs is 0) get prefix 0. Sizing by num_tokens instead
+                # of bs keeps seq_lens/req_pool_indices non-empty so the attention plan
+                # never calls max() on a 0-size tensor (and idle ranks issue the same
+                # collectives as busy ranks).
+                dev = self.seq_lens.device
+                real_bs = self.seq_lens.shape[0]
+                self.extend_num_tokens = num_tokens
+                self.extend_seq_lens = torch.ones(
+                    num_tokens, dtype=torch.int32, device=dev
+                )
+                self.extend_prefix_lens = torch.zeros(
+                    num_tokens, dtype=self.seq_lens.dtype, device=dev
+                )
+                if real_bs > 0:
+                    self.extend_prefix_lens[:real_bs] = self.seq_lens - 1
                 self.extend_start_loc = torch.arange(
-                    bs, dtype=torch.int32, device=self.seq_lens.device
+                    num_tokens, dtype=torch.int32, device=dev
                 )
                 self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu().tolist()
                 self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
+                bs = self.batch_size = num_tokens
             else:
                 if self.spec_info is not None:
                     bs = self.batch_size = (

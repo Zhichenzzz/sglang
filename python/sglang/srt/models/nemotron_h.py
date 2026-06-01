@@ -629,6 +629,10 @@ class NemotronHAttention(nn.Module):
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_idle()
+            # A decode/idle batch DP-padded into ForwardMode.EXTEND (MAX_LEN) still
+            # runs the padded-batch wrapper, so Q must stay padded. Genuine prefill
+            # has no _original_forward_mode and keeps trimming Q to the real tokens.
+            or getattr(forward_batch, "_original_forward_mode", None) is not None
         )
         original_out_cache_loc = forward_batch.out_cache_loc
 
@@ -641,7 +645,12 @@ class NemotronHAttention(nn.Module):
             if not keep_q_padded:
                 q = q[:real_tokens]
 
-        attn_output = self.attn.forward(q, k, v, forward_batch)
+        # An idle DP rank (real_tokens == 0) carries only fake padding rows; it must
+        # still run the attention collective but must NOT write KV (a 0-row store_cache
+        # launches a 0-grid kernel -> CUDA invalid argument).
+        attn_output = self.attn.forward(
+            q, k, v, forward_batch, save_kv_cache=real_tokens > 0
+        )
         # out_cache_loc is only consumed by self.attn.forward (KV write); restore it now.
         forward_batch.out_cache_loc = original_out_cache_loc
 
