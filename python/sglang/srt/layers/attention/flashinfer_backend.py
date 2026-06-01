@@ -1486,16 +1486,7 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
-        # An idle DP rank padded up to EXTEND (MAX_LEN) carries the empty idle
-        # EagleVerifyInput; its generate_attn_arg_prefill yields empty tensors and
-        # flashinfer plan() calls max() on a 0-numel input. Those rows are fake DP
-        # padding (output discarded), so build a normal-extend plan from the padded
-        # seq_lens instead. Real verify (non-empty draft_token) keeps the spec path.
-        _spec_is_empty = spec_info is not None and (
-            getattr(spec_info, "draft_token", None) is None
-            or spec_info.draft_token.numel() == 0
-        )
-        if spec_info is None or _spec_is_empty:
+        if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
