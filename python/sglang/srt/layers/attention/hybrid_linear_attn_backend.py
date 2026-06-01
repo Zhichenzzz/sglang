@@ -185,6 +185,15 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        # DP-attention pads each rank to a common row count for collective alignment
+        # (an idle rank is all padding). Padding rows reuse req_pool slot 0, whose
+        # mamba slot may be unallocated -> illegal access in the mixer. Mark them -1
+        # so the mamba kernels skip recurrent-state read/write for those rows — same
+        # sentinel the cuda-graph padding path uses (see init_*_cuda_graph).
+        _real_bs = getattr(forward_batch, "_original_batch_size", None)
+        if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
+            mamba_cache_indices = mamba_cache_indices.clone()
+            mamba_cache_indices[_real_bs:] = -1
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(

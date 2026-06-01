@@ -577,15 +577,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret.num_token_non_padded_cpu = num_tokens
 
         # For MLP sync
-        if __import__("os").environ.get("DBG_GNT"):
-            try:
-                from sglang.srt.layers.dp_attention import get_attention_dp_rank as _gdr
-                print("[DBG_GNT] r=%s mode=%s gnt_in=%s spec=%s draftworker=%s" % (
-                    _gdr(), ret.forward_mode, batch.global_num_tokens,
-                    type(batch.spec_info).__name__ if batch.spec_info is not None else None,
-                    getattr(model_runner, "is_draft_worker", "?")), flush=True)
-            except Exception as _e:
-                print("[DBG_GNT] fail %s" % _e, flush=True)
         if batch.global_num_tokens is not None:
             assert batch.global_num_tokens_for_logprob is not None
 
