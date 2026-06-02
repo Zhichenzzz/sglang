@@ -956,6 +956,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         bs = self.batch_size
 
+
         if (
             self.forward_mode.is_decode()
             or self.forward_mode.is_target_verify()
@@ -988,22 +989,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # collectives as busy ranks).
                 dev = self.seq_lens.device
                 real_bs = self.seq_lens.shape[0]
+                # Idle DP rank during a prefill step: no real requests, but it must
+                # emit num_tokens hidden rows so its all-gather matches the busy ranks.
+                # Represent that as ONE fake request spanning all num_tokens tokens
+                # (prefix 0), NOT num_tokens single-token requests -- the latter
+                # inflates bs past the attention backend's per-rank kv_indptr buffer
+                # (sized for ~max_running/dp_size reqs) and overflows it. One fake req
+                # keeps bs == 1 while still producing num_tokens rows; the output is
+                # discarded downstream (real_tokens == 0).
+                assert real_bs == 0, "extend-idle conversion expects an empty rank"
                 self.extend_num_tokens = num_tokens
-                self.extend_seq_lens = torch.ones(
-                    num_tokens, dtype=torch.int32, device=dev
+                self.extend_seq_lens = torch.tensor(
+                    [num_tokens], dtype=torch.int32, device=dev
                 )
                 self.extend_prefix_lens = torch.zeros(
-                    num_tokens, dtype=self.seq_lens.dtype, device=dev
+                    1, dtype=self.seq_lens.dtype, device=dev
                 )
-                if real_bs > 0:
-                    self.extend_prefix_lens[:real_bs] = self.seq_lens - 1
-                self.extend_start_loc = torch.arange(
-                    num_tokens, dtype=torch.int32, device=dev
+                self.extend_start_loc = torch.zeros(
+                    1, dtype=torch.int32, device=dev
                 )
-                self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu().tolist()
-                self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
-                self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
-                bs = self.batch_size = num_tokens
+                self.seq_lens = torch.tensor(
+                    [num_tokens], dtype=self.seq_lens.dtype, device=dev
+                )
+                self.seq_lens_sum = int(num_tokens)
+                if self.seq_lens_cpu is not None:
+                    self.seq_lens_cpu = torch.tensor(
+                        [num_tokens], dtype=self.seq_lens.dtype
+                    )
+                self.extend_prefix_lens_cpu = [0]
+                self.extend_seq_lens_cpu = [int(num_tokens)]
+                self.extend_logprob_start_lens_cpu = [0]
+                bs = self.batch_size = 1
             else:
                 if self.spec_info is not None:
                     bs = self.batch_size = (

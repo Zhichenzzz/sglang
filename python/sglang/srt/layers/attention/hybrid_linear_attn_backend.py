@@ -150,7 +150,18 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
-        if not forward_batch.forward_mode.is_extend() or self.is_draft_worker:
+        # TARGET_VERIFY reports is_extend()==True but must NOT clear the mamba state:
+        # the request's committed ssm/conv state has to survive the verify forward.
+        # In cuda-graph mode the verify skips init_forward_metadata (replay), so this
+        # never ran there; in eager mode it ran every verify step and zeroed the
+        # committed mamba state -> frozen state -> degenerate output. Only the genuine
+        # prefill EXTEND (fresh slot, mamba_needs_clear) should clear.
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or self.is_draft_worker
+        ):
             return
         if (
             forward_batch.mamba_clear_indices is not None

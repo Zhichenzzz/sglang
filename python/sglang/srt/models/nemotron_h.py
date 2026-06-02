@@ -638,12 +638,18 @@ class NemotronHAttention(nn.Module):
 
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if has_padding:
+        if has_padding and real_tokens > 0:
             k, v = k[:real_tokens], v[:real_tokens]
             if original_out_cache_loc is not None:
                 forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
             if not keep_q_padded:
                 q = q[:real_tokens]
+        # real_tokens == 0: a fully-idle DP rank carrying a synthesized fake prefill
+        # (one req spanning all num_tokens padding tokens, prefix 0). Keep Q/K/V at the
+        # padded length so the prefill ragged kernel sees a well-formed self-attention
+        # (matching cu_seqlens); trimming K/V to 0 while Q stays padded makes the kernel
+        # read past K/V (TMA-descriptor / illegal-instruction failure). save_kv_cache is
+        # False below so no KV is written, and the output rows are zeroed afterwards.
 
         # An idle DP rank (real_tokens == 0) carries only fake padding rows; it must
         # still run the attention collective but must NOT write KV (a 0-row store_cache
